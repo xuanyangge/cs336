@@ -1,0 +1,99 @@
+from collections.abc import Iterable
+import time
+from collections import Counter, defaultdict
+from functools import partial, cmp_to_key
+from multiprocessing import Pool
+from typing import IO, Any, BinaryIO, Iterator
+import regex as re
+import os
+from .common import split_by_pat, split_by_special_tokens
+
+
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+        self.vocab_look_up = {b:i for (i, b) in self.vocab }  
+        special_tokens_bytes = [s.encode('utf-8') for s in special_tokens]
+        self.special_tokens_map = {b: self.vocab_look_up[b] for b in special_tokens_bytes }
+
+    # Construct a tokenizer from a given 
+    # vocabulary, list of merges, and (optionally) a list of special tokens. This function should accept 
+    # the following parameters:
+    # vocab: dict[int, bytes]  
+    # merges: list[tuple[bytes, bytes]]  
+    # special_tokens: list[str] | None = None  
+
+    # def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+    # # Class method 
+    # # that constructs and returns a Tokenizer from a serialized vocabulary and list of merges (in the 
+    # # same format that your BPE training code output) and (optionally) a list of special tokens. 
+    # # This method should accept the following additional parameters:
+    # # vocab_filepath: str  
+    # # merges_filepath: str  
+    # # special_tokens: list[str] | None = None  
+    #     return Tokenizer(
+    #         ...
+    #     )
+
+    def encode_word(self, word:str):
+        return
+
+    def encode(self, text: str) -> list[int]:        
+        #  Encode an input text into a sequence of token IDs.
+        re_pattern = "|".join([re.escape(special_token) for special_token in self.special_tokens])
+        re_pattern = "(" + re_pattern + ")"
+        res = []
+        for m in re.finditer(re_pattern):
+            group_s = m.goup()
+            if group_s == '':
+                continue
+            
+            group_b = group_s.encode('utf-8')
+            if group_b in self.special_tokens_map:
+                res.append(self.special_tokens_map[group_b])
+            else:
+                res.append(self.encode_word())
+        return res
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        # Given an iterable of 
+        # strings (e.g., a Python file handle), return a generator that lazily yields token IDs. This is 
+        # required for memory-efficient tokenization of large files that we cannot directly load into 
+        # memory.
+        return
+    
+    def decode(self, ids: list[int]) -> str:
+
+
+
+    # Decode a sequence of token IDs into text.
+    # To test your Tokenizer against our provided tests, you will first need to implement the test 
+    # adapter at [adapters.get_tokenizer] . Then, run uv run pytest tests/test_tokenizer.py. Your 
+    # implementation should be able to pass all tests.
+
+
+
+
+def get_tokenizer(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    special_tokens: list[str] | None = None,
+) -> Any:
+    """Given a vocabulary, a list of merges, and a list of special tokens,
+    return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
+
+    Args:
+        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+            to bytes (token bytes)
+        merges (list[tuple[bytes, bytes]]): BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+            representing that <token1> was merged with <token2>.
+            Merges are ordered by order of creation.
+        special_tokens (list[str] | None): A list of string special tokens for the tokenizer. These strings will never
+            be split into multiple tokens, and will always be kept as a single token.
+
+    Returns:
+        A BPE tokenizer that uses the provided vocab, merges, and special tokens.
+    """
+    raise NotImplementedError

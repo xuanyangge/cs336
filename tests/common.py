@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+from collections import Counter
 import pathlib
 from functools import lru_cache
+import regex as re
 
 FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent) / "fixtures"
 
+def split_by_special_tokens(input_s: str,  special_tokens: list[str]):
+    re_pattern = "|".join([re.escape(special_token) for special_token in special_tokens])
+    results = re.split(re_pattern, input_s)
+    return results
+
+
+def split_by_pat(input_strings: list[str]):
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    results_unflatten = [re.findall(PAT, ss) for ss in input_strings]
+    results_flattened = [item for sublist in results_unflatten for item in sublist]
+    return results_flattened
+    
 
 @lru_cache
 def gpt2_bytes_to_unicode() -> dict[int, str]:
