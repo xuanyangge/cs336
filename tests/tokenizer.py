@@ -6,8 +6,9 @@ from multiprocessing import Pool
 from typing import IO, Any, BinaryIO, Iterator
 import regex as re
 import os
+from heapdict import heapdict
+from collections import deque
 from .common import split_by_pat, split_by_special_tokens
-
 
 class Tokenizer:
     def __init__(self, vocab, merges, special_tokens=None):
@@ -15,6 +16,7 @@ class Tokenizer:
         self.merges = merges
         self.special_tokens = special_tokens
         self.vocab_look_up = {b:i for (i, b) in self.vocab }  
+        self.merges_look_up = {tup: i for (i, tup) in merges }
         special_tokens_bytes = [s.encode('utf-8') for s in special_tokens]
         self.special_tokens_map = {b: self.vocab_look_up[b] for b in special_tokens_bytes }
 
@@ -37,15 +39,43 @@ class Tokenizer:
     #         ...
     #     )
 
-    def encode_word(self, word:str):
-        return
+    def encode_word(self, word: str):
+        word_bytes = word.encode("utf-8")
+        cur_tokens = [self.vocab[b] for b in word_bytes]
+        # A larger token must have a subtoken with lower rank before it.
+        # Thus we can do the greedy algorithm here.
+        p_q = heapdict()
+        tokens_linked_list = deque(cur_tokens)
+        for i in range(len(cur_tokens) - 1):
+            tup = (cur_tokens[i], cur_tokens[i+1])
+            if tup in self.merges_look_up:
+                p_q[(tup, i)] = self.merges_look_up[tup]
+            
+        while p_q:
+            top = p_q.popitem()
+            tup = top[0]
+            ind = tup[1]
+            tokens_linked_list.remove(ind)
+            tokens_linked_list[ind-1] =  
+            tokens_linked_list[ind]
+
+
+
+
+
+    def encoding_generator(self, non_speical_text:str):
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        for word_match in re.finditer(non_speical_text, PAT):
+            yield self.encode_word(word_match) 
 
     def encode(self, text: str) -> list[int]:        
         #  Encode an input text into a sequence of token IDs.
         re_pattern = "|".join([re.escape(special_token) for special_token in self.special_tokens])
         re_pattern = "(" + re_pattern + ")"
         res = []
-        for m in re.finditer(re_pattern):
+        last = 0 
+        for m in re.finditer(re_pattern, text):
+            last = m.end
             group_s = m.goup()
             if group_s == '':
                 continue
@@ -54,7 +84,17 @@ class Tokenizer:
             if group_b in self.special_tokens_map:
                 res.append(self.special_tokens_map[group_b])
             else:
+                for word in self.encoding_generator(group_s):
+                    # change here.
+                    yield word
+
                 res.append(self.encode_word())
+        
+        # this is some sudo code
+        if last < len(text):
+            for word in self.encoding_generator(text[last:]):
+                yield word
+
         return res
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
