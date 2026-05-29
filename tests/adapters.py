@@ -102,6 +102,26 @@ def run_embedding(
     return embedding(token_ids)
 
 
+class MyESiglu(torch.nn.Module):
+    def __init__(self,
+                d_model: int,
+                d_ff: int,
+                device=None, 
+                dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.w1 = torch.nn.Parameter(torch.empty(d_ff, d_model))
+        self.w2 = torch.nn.parameter(torch.empty(d_model, d_ff))
+        self.w3 = torch.nn.Parameter(torch.empty(d_ff, d_model))
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w1_x = self.w1 @ x 
+        silu_w1_x = w1_x * torch.sigmoid(w1_x)
+        w1_w3 = silu_w1_x * (self.w3 * x) 
+        out = self.w2 @ w1_w3
+        return out
+    
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -419,10 +439,12 @@ class MyRMSNorm(torch.nn.Module):
         # Note: Remember to upcast your input to torch.float32 before performing the normalization
         # (and later downcast to the original dtype), as described above.
         # x is (batch_size, sequence_length, d_model)
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
         squares = x**2
         rms = torch.sqrt(squares.mean(dim=-1, keepdim=True) + self.eps)
         x = x / rms * self.g
-        return x
+        return x.to(in_dtype)
 
 
 def run_rmsnorm(
