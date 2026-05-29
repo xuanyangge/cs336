@@ -102,7 +102,7 @@ def run_embedding(
     return embedding(token_ids)
 
 
-class MyESiglu(torch.nn.Module):
+class MySwiglu(torch.nn.Module):
     def __init__(self,
                 d_model: int,
                 d_ff: int,
@@ -112,7 +112,7 @@ class MyESiglu(torch.nn.Module):
         self.d_model = d_model
         self.d_ff = d_ff
         self.w1 = torch.nn.Parameter(torch.empty(d_ff, d_model))
-        self.w2 = torch.nn.parameter(torch.empty(d_model, d_ff))
+        self.w2 = torch.nn.Parameter(torch.empty(d_model, d_ff))
         self.w3 = torch.nn.Parameter(torch.empty(d_ff, d_model))
  
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -151,7 +151,15 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+
+    swiglu = MySwiglu(
+        d_model,
+        d_ff
+    )
+
+    swiglu.load_state_dict({"w1": w1_weight, "w2": w2_weight, "w3": w3_weight})
+
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
