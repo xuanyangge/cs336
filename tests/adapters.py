@@ -7,8 +7,49 @@ from typing import IO, Any, BinaryIO
 import numpy.typing as npt
 import torch
 import regex as re
+import math
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+
+class MyLinear(torch.nn.Module):
+    """
+    A linear transformation module.
+
+    Args:
+        in_features (int): The size of the input dimension
+        out_features (int): The size of the output dimension
+        device (torch.device | None = None): Device to store the parameters on
+        dtype (torch.dtype | None = None): Data type of the parameters
+    """
+
+    def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weights = torch.nn.Parameter(torch.empty(out_features, in_features))
+        self.device = device
+        self.dtype = dtype
+        # self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x @ self.weight.T
+        return out
+
+
+class MyEmbedding(torch.nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weights = torch.nn.Parameter(torch.empty(num_embeddings, embedding_dim))
+        self.device = device
+        self.dtype = dtype
+        # self.reset_parameters()
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        out = self.weights[token_ids]
+        return out
 
 
 def run_linear(
@@ -29,8 +70,13 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    layer = MyLinear(d_in, d_out)
+    layer.load_state_dict(
+        {
+            "weights": weights,
+        }
+    )
+    return layer(in_features)
 
 
 def run_embedding(
@@ -51,8 +97,9 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    embedding = MyEmbedding(vocab_size, d_model)
+    embedding.load_state_dict({"weights": weights})
+    return embedding(token_ids)
 
 
 def run_swiglu(
@@ -359,6 +406,25 @@ def run_transformer_lm(
     raise NotImplementedError
 
 
+class MyRMSNorm(torch.nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        self.eps = eps
+        self.device = device
+        self.dtype = dtype
+        # self.reset_parameters()
+        self.g = torch.nn.Parameter(torch.empty(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Note: Remember to upcast your input to torch.float32 before performing the normalization
+        # (and later downcast to the original dtype), as described above.
+        # x is (batch_size, sequence_length, d_model)
+        squares = x**2
+        rms = torch.sqrt(squares.mean(dim=-1, keepdim=True) + self.eps)
+        x = x / rms * self.g
+        return x
+
+
 def run_rmsnorm(
     d_model: int,
     eps: float,
@@ -379,7 +445,9 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms_norm = MyRMSNorm(d_model, eps)
+    rms_norm.load_state_dict({"g": weights})
+    return rms_norm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -537,76 +605,4 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
-
-
-def get_tokenizer(
-    vocab: dict[int, bytes],
-    merges: list[tuple[bytes, bytes]],
-    special_tokens: list[str] | None = None,
-) -> Any:
-    """Given a vocabulary, a list of merges, and a list of special tokens,
-    return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
-
-    Args:
-        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-            to bytes (token bytes)
-        merges (list[tuple[bytes, bytes]]): BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-            representing that <token1> was merged with <token2>.
-            Merges are ordered by order of creation.
-        special_tokens (list[str] | None): A list of string special tokens for the tokenizer. These strings will never
-            be split into multiple tokens, and will always be kept as a single token.
-
-    Returns:
-        A BPE tokenizer that uses the provided vocab, merges, and special tokens.
-    """
-    raise NotImplementedError
-
-def run_train_bpe(
-    input_path: str | os.PathLike,
-    vocab_size: int,
-    special_tokens: list[str],
-    **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
-
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
-    """
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    
-    with open(input_path, "rb") as f:
-        num_processes = 4
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            print(chunk)
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            # 1. splits all chunks by special_tokens, put special tokens into vocab
-            # 2. count each chunk with adjcent token, 
-            # 3. Merge all counts, find the next merge. Question: Is the merge added to the vocab? Yes
-            # 4. Repeat. 
-            # initial vaocab is just 0-255 single byte value. 
-
-
     raise NotImplementedError
