@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
+from math import sqrt
 
 import numpy.typing as npt
 import torch
 import regex as re
 import math
+from einops import rearrange, einsum
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -103,25 +105,22 @@ def run_embedding(
 
 
 class MySwiglu(torch.nn.Module):
-    def __init__(self,
-                d_model: int,
-                d_ff: int,
-                device=None, 
-                dtype=None):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
         self.w1 = torch.nn.Parameter(torch.empty(d_ff, d_model))
         self.w2 = torch.nn.Parameter(torch.empty(d_model, d_ff))
         self.w3 = torch.nn.Parameter(torch.empty(d_ff, d_model))
- 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w1_x = self.w1 @ x 
+        w1_x = einsum(self.w1, x, "d_ff d_model, ... d_model -> ... d_ff")
         silu_w1_x = w1_x * torch.sigmoid(w1_x)
-        w1_w3 = silu_w1_x * (self.w3 * x) 
-        out = self.w2 @ w1_w3
+        w1_w3 = silu_w1_x * einsum(self.w3, x, "d_ff d_model, ... d_model -> ... d_ff")
+        out = einsum(self.w2, w1_w3, "d_model d_ff, ... d_ff -> ... d_model")
         return out
-    
+
+
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -152,10 +151,7 @@ def run_swiglu(
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
 
-    swiglu = MySwiglu(
-        d_model,
-        d_ff
-    )
+    swiglu = MySwiglu(d_model, d_ff)
 
     swiglu.load_state_dict({"w1": w1_weight, "w2": w2_weight, "w3": w3_weight})
 
@@ -180,6 +176,10 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
+
+    Q_K_T = einsum(Q, K, "... queries, ... keys -> ... quries keys")
+    d_k = Q.shape[-1]
+    Q_K_T = Q_K_T / sqrt(d_k)
     raise NotImplementedError
 
 
@@ -257,6 +257,68 @@ def run_multihead_self_attention_with_rope(
     raise NotImplementedError
 
 
+class MyRope(torch.nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        self.register_buffer("rope_cos", torch.empty(max_seq_len, d_k, device=device))
+
+        # torch.arange works like Python's range but returns a tensor:
+
+        #   torch.arange(5)        # tensor([0, 1, 2, 3, 4])
+        #   torch.arange(2, 8)     # tensor([2, 3, 4, 5, 6, 7])
+        #   torch.arange(0, 1, 0.2)  # tensor([0.0, 0.2, 0.4, 0.6, 0.8])
+
+        #   torch.outer takes two 1D tensors and produces a 2D matrix where each entry (i, j) is a[i] * b[j]:
+
+        #   a = torch.tensor([1, 2, 3])
+        #   b = torch.tensor([10, 20])
+        #   torch.outer(a, b)
+        #   # tensor([[10, 20],
+        #   #         [20, 40],
+        #   #         [30, 60]])
+
+        # let's think about rope matrix, it should be max_seq_len, d_k, d_k tensor.
+        # For each d_k d_k tensor, it's a diagonal matrix with cosine and sine values.
+
+        # we will use outer to along the max_seq_len axis.
+
+        arr = torch.arange(1.0, d_k // 2 + 1.0, 1)
+        arr = self.theta ** (-1 * (2 * arr - 2) / d_k)
+        seq = torch.arange(0, max_seq_len * 1.0, 1)
+        # (max_seq_len, d_k / 2)
+        angle_matrix = torch.outer(seq, arr)
+
+        cos = torch.cos(angle_matrix)
+        sin = torch.sin(angle_matrix)
+        top = torch.stack([cos, -1 * sin], dim=2)
+        bottom = torch.stack([sin, cos], dim=2)
+        # (max_seq_len, d_k / 2, 2, 2)
+        # top = (cos, -sin)
+        # bottom = (sin, cos)
+        # if by dim = 3 it would create (cos sin) instead
+        #                               (-sin cos)
+        self.rotation_matrix = torch.stack([top, bottom], dim=2)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        # Transform x into " ... sequence_length (2 d_k/2)" from " ... sequence_length d_k"
+        # x is already Qx which is already query mutliplied by x.
+        # rotation matrix: (max_seq_len, d_k / 2, 2,)
+        x = rearrange(x, "... sequence_length (out two) -> ... sequence_length out two", two=2)
+        res = einsum(
+            self.rotation_matrix[token_positions],
+            x,
+            "sequence_length out two_i two_j, ... sequence_length out two_j -> ... sequence_length out two_i",
+        )
+        res = rearrange(res, "... sequence_length out two -> ... sequence_length (out two)")
+        return res
+
+        # Syntax:
+        # w1_x = einsum(self.w1, x, "d_ff d_model, ... d_model -> ... d_ff")
+
+
 def run_rope(
     d_k: int,
     theta: float,
@@ -276,7 +338,14 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+
+    my_rope = MyRope(
+        theta,
+        d_k,
+        max_seq_len,
+    )
+
+    return my_rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -517,6 +586,21 @@ def run_get_batch(
     raise NotImplementedError
 
 
+class MySoftmax(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
+        self.device = device
+        self.dtype = dtype
+        # self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x @ self.weight.T
+        return out
+
+
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
     Given a tensor of inputs, return the output of softmaxing the given `dim`
@@ -530,7 +614,12 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+
+    dim_max = torch.amax(in_features, dim=dim, keepdim=True)
+    in_features_subtraced = in_features - dim_max
+    in_features_subtraced = torch.exp(in_features_subtraced)
+    in_features_subtraced_sum = torch.sum(in_features_subtraced, dim=dim, keepdim=True)
+    return in_features_subtraced / in_features_subtraced_sum
 
 
 def run_cross_entropy(
