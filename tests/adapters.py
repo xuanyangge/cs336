@@ -177,10 +177,14 @@ def run_scaled_dot_product_attention(
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
 
-    Q_K_T = einsum(Q, K, "... queries, ... keys -> ... quries keys")
+    Q_K_T = einsum(Q, K, "... queries d_k, ... keys d_k-> ... queries keys")
     d_k = Q.shape[-1]
     Q_K_T = Q_K_T / sqrt(d_k)
-    raise NotImplementedError
+    if mask is not None:
+        infinity_matrix = torch.full_like(Q_K_T, -1 * torch.inf)
+        Q_K_T = torch.where(mask, Q_K_T, infinity_matrix)
+    soft_maxed_Q_K_t = run_softmax(Q_K_T, -1)
+    return einsum(soft_maxed_Q_K_t, V, "... queries keys, ... keys d_v -> ... queries d_v")
 
 
 def run_multihead_self_attention(
