@@ -187,6 +187,30 @@ def run_scaled_dot_product_attention(
     return einsum(soft_maxed_Q_K_t, V, "... queries keys, ... keys d_v -> ... queries d_v")
 
 
+class MyMultiHeadAttneion(torch.nn.Module):
+    def __init__(self, d_model, num_heads, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        self.q = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
+        print("shape", self.q.shape)
+        self.k = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
+        self.v = torch.nn.Parameter(torch.empty(num_heads, self.d_v, self.d_model))
+        self.o = torch.nn.Parameter(torch.empty(self.d_model, self.d_model))
+
+    def forward(self, in_features: torch.Tensor) -> torch.Tensor:
+        w_v_x = einsum(self.v, in_features, "num_heads d_v d_model, ... d_model -> num_heads ... d_v")
+        w_k_x = einsum(self.k, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+        w_q_x = einsum(self.q, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+        mask = torch.tril(torch.full((in_features.shape[-2], in_features.shape[-2]), 1)).bool()
+        attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask)
+        # attenion is num_heads queries d_v
+        concatted_attention = rearrange(attention, "num_heads ... queries d_v -> ... queries (num_heads d_v)")
+        return einsum(self.o, concatted_attention, "d_model d_model2, ... seq_len d_model2 -> ... seq_len d_model")
+
+
 def run_multihead_self_attention(
     d_model: int,
     num_heads: int,
@@ -218,7 +242,16 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    head_attention = MyMultiHeadAttneion(d_model, num_heads)
+    head_attention.load_state_dict(
+        {
+            "q": rearrange(q_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
+            "k": rearrange(k_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
+            "v": rearrange(v_proj_weight, "(num_heads d_v)  d_model2 -> num_heads d_v d_model2", num_heads=num_heads),
+            "o": o_proj_weight,
+        }
+    )
+    return head_attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -258,6 +291,10 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
+
+    # use torch.triu to construct mask.
+    # Rope applied  to q v fo each head.
+
     raise NotImplementedError
 
 
