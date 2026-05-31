@@ -187,15 +187,16 @@ def run_scaled_dot_product_attention(
     return einsum(soft_maxed_Q_K_t, V, "... queries keys, ... keys d_v -> ... queries d_v")
 
 
-class MyMultiHeadAttneion(torch.nn.Module):
-    def __init__(self, d_model, num_heads, device=None, dtype=None):
+class MyMultiHeadAttention(torch.nn.Module):
+    def __init__(self, d_model, num_heads, device=None, dtype=None, rope=None, token_positions=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
+        self.rope = rope
+        self.token_positions = token_positions
         self.q = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
-        print("shape", self.q.shape)
         self.k = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
         self.v = torch.nn.Parameter(torch.empty(num_heads, self.d_v, self.d_model))
         self.o = torch.nn.Parameter(torch.empty(self.d_model, self.d_model))
@@ -204,6 +205,9 @@ class MyMultiHeadAttneion(torch.nn.Module):
         w_v_x = einsum(self.v, in_features, "num_heads d_v d_model, ... d_model -> num_heads ... d_v")
         w_k_x = einsum(self.k, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
         w_q_x = einsum(self.q, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+        if self.rope is not None:
+            w_k_x = self.rope(w_k_x, self.token_positions)
+            w_q_x = self.rope(w_q_x, self.token_positions)
         mask = torch.tril(torch.full((in_features.shape[-2], in_features.shape[-2]), 1)).bool()
         attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask)
         # attenion is num_heads queries d_v
@@ -242,7 +246,7 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    head_attention = MyMultiHeadAttneion(d_model, num_heads)
+    head_attention = MyMultiHeadAttention(d_model, num_heads)
     head_attention.load_state_dict(
         {
             "q": rearrange(q_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
@@ -294,8 +298,20 @@ def run_multihead_self_attention_with_rope(
 
     # use torch.triu to construct mask.
     # Rope applied  to q v fo each head.
+    d_k = d_model // num_heads
+    rope = MyRope(theta, d_k, max_seq_len)
+    head_attention = MyMultiHeadAttention(d_model, num_heads, rope=rope, token_positions=token_positions)
+    head_attention.load_state_dict(
+        {
+            "q": rearrange(q_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
+            "k": rearrange(k_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
+            "v": rearrange(v_proj_weight, "(num_heads d_v)  d_model2 -> num_heads d_v d_model2", num_heads=num_heads),
+            "o": o_proj_weight,
+        },
+        strict=False,
+    )
 
-    raise NotImplementedError
+    return head_attention(in_features)
 
 
 class MyRope(torch.nn.Module):
@@ -304,8 +320,6 @@ class MyRope(torch.nn.Module):
         self.theta = theta
         self.d_k = d_k
         self.max_seq_len = max_seq_len
-        self.register_buffer("rope_cos", torch.empty(max_seq_len, d_k, device=device))
-
         # torch.arange works like Python's range but returns a tensor:
 
         #   torch.arange(5)        # tensor([0, 1, 2, 3, 4])
@@ -320,11 +334,6 @@ class MyRope(torch.nn.Module):
         #   # tensor([[10, 20],
         #   #         [20, 40],
         #   #         [30, 60]])
-
-        # let's think about rope matrix, it should be max_seq_len, d_k, d_k tensor.
-        # For each d_k d_k tensor, it's a diagonal matrix with cosine and sine values.
-
-        # we will use outer to along the max_seq_len axis.
 
         arr = torch.arange(1.0, d_k // 2 + 1.0, 1)
         arr = self.theta ** (-1 * (2 * arr - 2) / d_k)
@@ -341,17 +350,19 @@ class MyRope(torch.nn.Module):
         # bottom = (sin, cos)
         # if by dim = 3 it would create (cos sin) instead
         #                               (-sin cos)
-        self.rotation_matrix = torch.stack([top, bottom], dim=2)
+        self.register_buffer("rotation_matrix", torch.stack([top, bottom], dim=2))
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         # Transform x into " ... sequence_length (2 d_k/2)" from " ... sequence_length d_k"
         # x is already Qx which is already query mutliplied by x.
         # rotation matrix: (max_seq_len, d_k / 2, 2,)
         x = rearrange(x, "... sequence_length (out two) -> ... sequence_length out two", two=2)
+        # Needs ... in the first opeartor because token positions could be tensor as well.
+        # The torch syntax is super rich.
         res = einsum(
             self.rotation_matrix[token_positions],
             x,
-            "sequence_length out two_i two_j, ... sequence_length out two_j -> ... sequence_length out two_i",
+            "... sequence_length out two_i two_j, ... sequence_length out two_j -> ... sequence_length out two_i",
         )
         res = rearrange(res, "... sequence_length out two -> ... sequence_length (out two)")
         return res
