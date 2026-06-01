@@ -188,26 +188,25 @@ def run_scaled_dot_product_attention(
 
 
 class MyMultiHeadAttention(torch.nn.Module):
-    def __init__(self, d_model, num_heads, device=None, dtype=None, rope=None, token_positions=None):
+    def __init__(self, d_model, num_heads, device=None, dtype=None, rope=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
         self.rope = rope
-        self.token_positions = token_positions
         self.q = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
         self.k = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
         self.v = torch.nn.Parameter(torch.empty(num_heads, self.d_v, self.d_model))
         self.o = torch.nn.Parameter(torch.empty(self.d_model, self.d_model))
 
-    def forward(self, in_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
         w_v_x = einsum(self.v, in_features, "num_heads d_v d_model, ... d_model -> num_heads ... d_v")
         w_k_x = einsum(self.k, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
         w_q_x = einsum(self.q, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
         if self.rope is not None:
-            w_k_x = self.rope(w_k_x, self.token_positions)
-            w_q_x = self.rope(w_q_x, self.token_positions)
+            w_k_x = self.rope(w_k_x, token_positions)
+            w_q_x = self.rope(w_q_x, token_positions)
         mask = torch.tril(torch.full((in_features.shape[-2], in_features.shape[-2]), 1)).bool()
         attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask)
         # attenion is num_heads queries d_v
@@ -255,7 +254,7 @@ def run_multihead_self_attention(
             "o": o_proj_weight,
         }
     )
-    return head_attention(in_features)
+    return head_attention(in_features, token_positions=None)
 
 
 def run_multihead_self_attention_with_rope(
@@ -300,7 +299,7 @@ def run_multihead_self_attention_with_rope(
     # Rope applied  to q v fo each head.
     d_k = d_model // num_heads
     rope = MyRope(theta, d_k, max_seq_len)
-    head_attention = MyMultiHeadAttention(d_model, num_heads, rope=rope, token_positions=token_positions)
+    head_attention = MyMultiHeadAttention(d_model, num_heads, rope=rope)
     head_attention.load_state_dict(
         {
             "q": rearrange(q_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
@@ -311,7 +310,7 @@ def run_multihead_self_attention_with_rope(
         strict=False,
     )
 
-    return head_attention(in_features)
+    return head_attention(in_features, token_positions=token_positions)
 
 
 class MyRope(torch.nn.Module):
@@ -400,6 +399,28 @@ def run_rope(
     return my_rope(in_query_or_key, token_positions)
 
 
+class MyTransformerBlock(torch.nn.Module):
+    def __init__(self, d_model, d_ff, rope: MyRope, num_heads=4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.norm1 = MyRMSNorm(d_model)
+        self.mha = MyMultiHeadAttention(d_model, num_heads, rope=rope)
+        self.swiglu = MySwiglu(d_model, d_ff)
+        self.norm2 = MyRMSNorm(d_model)
+        self.rope = rope
+
+    def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
+        x = in_features
+        t = self.norm1(x)
+        t = self.mha(t, token_positions)
+        y = x + t
+        ff = self.norm2(y)
+        ff = self.swiglu(ff)
+        return ff + y
+
+
 def run_transformer_block(
     d_model: int,
     num_heads: int,
@@ -470,7 +491,36 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+
+    d_k = d_model // num_heads
+    rope = MyRope(theta, d_k, max_seq_len)
+
+    transformer_block = MyTransformerBlock(d_model, d_ff, rope, num_heads)
+
+    transformer_block.load_state_dict(
+        {
+            "norm1.g": weights["ln1.weight"],
+            "mha.q": rearrange(
+                weights["attn.q_proj.weight"], "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=num_heads
+            ),
+            "mha.k": rearrange(
+                weights["attn.k_proj.weight"], "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=num_heads
+            ),
+            "mha.v": rearrange(
+                weights["attn.v_proj.weight"], "(num_heads d_v) d_model -> num_heads d_v d_model", num_heads=num_heads
+            ),
+            "mha.o": weights["attn.output_proj.weight"],
+            "swiglu.w1": weights["ffn.w1.weight"],
+            "swiglu.w2": weights["ffn.w2.weight"],
+            "swiglu.w3": weights["ffn.w3.weight"],
+            "norm2.g": weights["ln2.weight"],
+        },
+        strict=False,
+    )
+
+    # token_positions: Int[Tensor, " ... sequence_length"]
+    token_positions = torch.arange(in_features.shape[-2]).unsqueeze(0).expand(in_features.shape[:-1])
+    return transformer_block(in_features, token_positions)
 
 
 def run_transformer_lm(
