@@ -523,6 +523,39 @@ def run_transformer_block(
     return transformer_block(in_features, token_positions)
 
 
+class MyTransformerLM(torch.nn.Module):
+    def __init__(self, vocab_size, context_length, d_model, d_ff, num_layers, rope_theta, num_heads=4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.layers = []
+
+        d_k = d_model // num_heads
+        rope = MyRope(rope_theta, d_k, context_length)
+        self.toke
+        self.rope = rope
+        for i in num_layers:
+            self.layers.append(MyTransformerBlock(d_model, d_ff, rope, num_heads))
+
+        self.token_embeddings = MyEmbedding(vocab_size, d_model)
+        self.ln_final = MyRMSNorm(d_model)
+        self.lm_head = MyLinear(d_model, vocab_size)
+
+    def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
+        x = in_features
+        x = self.token_embeddings(x)
+        for layer in self.layers:
+            x = layer(x)
+
+        # Output of layer is Float[Tensor, "batch sequence_length d_model"]
+        x = self.ln_final(x)
+        x = self.lm_head(x)
+        x = run_softmax(x, -1)
+
+        return x
+
+
 def run_transformer_lm(
     vocab_size: int,
     context_length: int,
@@ -602,6 +635,12 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
+
+    d_k = d_model // num_heads
+    rope = MyRope(rope_theta, d_k, context_length)
+
+    transformer_block = MyTransformerBlock(d_model, d_ff, rope, num_heads)
+
     raise NotImplementedError
 
 
@@ -686,21 +725,6 @@ def run_get_batch(
         language modeling labels.
     """
     raise NotImplementedError
-
-
-class MySoftmax(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
-        self.device = device
-        self.dtype = dtype
-        # self.reset_parameters()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x @ self.weight.T
-        return out
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
