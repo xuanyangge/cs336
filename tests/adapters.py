@@ -195,15 +195,25 @@ class MyMultiHeadAttention(torch.nn.Module):
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
         self.rope = rope
-        self.q = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
-        self.k = torch.nn.Parameter(torch.empty(num_heads, self.d_k, self.d_model))
-        self.v = torch.nn.Parameter(torch.empty(num_heads, self.d_v, self.d_model))
-        self.o = torch.nn.Parameter(torch.empty(self.d_model, self.d_model))
+        self.q_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model))
+        self.k_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model))
+        self.v_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model))
+        self.output_proj = torch.nn.Parameter(torch.empty(self.d_model, self.d_model))
 
     def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
-        w_v_x = einsum(self.v, in_features, "num_heads d_v d_model, ... d_model -> num_heads ... d_v")
-        w_k_x = einsum(self.k, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
-        w_q_x = einsum(self.q, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+        v_proj = rearrange(
+            self.v_proj, "(num_heads d_v) d_model -> num_heads d_v d_model", num_heads=self.num_heads, d_v=self.d_v
+        )
+        k_proj = rearrange(
+            self.k_proj, "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=self.num_heads, d_k=self.d_k
+        )
+        q_proj = rearrange(
+            self.q_proj, "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=self.num_heads, d_k=self.d_k
+        )
+
+        w_v_x = einsum(v_proj, in_features, "num_heads d_v d_model, ... d_model -> num_heads ... d_v")
+        w_k_x = einsum(k_proj, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+        w_q_x = einsum(q_proj, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
         if self.rope is not None:
             w_k_x = self.rope(w_k_x, token_positions)
             w_q_x = self.rope(w_q_x, token_positions)
@@ -211,7 +221,9 @@ class MyMultiHeadAttention(torch.nn.Module):
         attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask)
         # attenion is num_heads queries d_v
         concatted_attention = rearrange(attention, "num_heads ... queries d_v -> ... queries (num_heads d_v)")
-        return einsum(self.o, concatted_attention, "d_model d_model2, ... seq_len d_model2 -> ... seq_len d_model")
+        return einsum(
+            self.output_proj, concatted_attention, "d_model d_model2, ... seq_len d_model2 -> ... seq_len d_model"
+        )
 
 
 def run_multihead_self_attention(
@@ -248,9 +260,9 @@ def run_multihead_self_attention(
     head_attention = MyMultiHeadAttention(d_model, num_heads)
     head_attention.load_state_dict(
         {
-            "q": rearrange(q_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
-            "k": rearrange(k_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
-            "v": rearrange(v_proj_weight, "(num_heads d_v)  d_model2 -> num_heads d_v d_model2", num_heads=num_heads),
+            "q": q_proj_weight,
+            "k": k_proj_weight,
+            "v": v_proj_weight,
             "o": o_proj_weight,
         }
     )
@@ -405,19 +417,19 @@ class MyTransformerBlock(torch.nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
-        self.norm1 = MyRMSNorm(d_model)
-        self.mha = MyMultiHeadAttention(d_model, num_heads, rope=rope)
-        self.swiglu = MySwiglu(d_model, d_ff)
-        self.norm2 = MyRMSNorm(d_model)
+        self.ln1 = MyRMSNorm(d_model)
+        self.attn = MyMultiHeadAttention(d_model, num_heads, rope=rope)
+        self.ffn = MySwiglu(d_model, d_ff)
+        self.ln2 = MyRMSNorm(d_model)
         self.rope = rope
 
     def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
         x = in_features
-        t = self.norm1(x)
-        t = self.mha(t, token_positions)
+        t = self.ln1(x)
+        t = self.attn(t, token_positions)
         y = x + t
-        ff = self.norm2(y)
-        ff = self.swiglu(ff)
+        ff = self.ln2(y)
+        ff = self.ffn(ff)
         return ff + y
 
 
@@ -498,27 +510,11 @@ def run_transformer_block(
     transformer_block = MyTransformerBlock(d_model, d_ff, rope, num_heads)
 
     transformer_block.load_state_dict(
-        {
-            "norm1.g": weights["ln1.weight"],
-            "mha.q": rearrange(
-                weights["attn.q_proj.weight"], "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=num_heads
-            ),
-            "mha.k": rearrange(
-                weights["attn.k_proj.weight"], "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=num_heads
-            ),
-            "mha.v": rearrange(
-                weights["attn.v_proj.weight"], "(num_heads d_v) d_model -> num_heads d_v d_model", num_heads=num_heads
-            ),
-            "mha.o": weights["attn.output_proj.weight"],
-            "swiglu.w1": weights["ffn.w1.weight"],
-            "swiglu.w2": weights["ffn.w2.weight"],
-            "swiglu.w3": weights["ffn.w3.weight"],
-            "norm2.g": weights["ln2.weight"],
-        },
+        weights,
         strict=False,
     )
 
-    # token_positions: Int[Tensor, " ... sequence_length"]
+    # assert False, f"Weights: {weights.keys()}\nModel: {transformer_block.state_dict().keys()}"
     token_positions = torch.arange(in_features.shape[-2]).unsqueeze(0).expand(in_features.shape[:-1])
     return transformer_block(in_features, token_positions)
 
@@ -533,7 +529,6 @@ class MyTransformerLM(torch.nn.Module):
 
         d_k = d_model // num_heads
         rope = MyRope(rope_theta, d_k, context_length)
-        self.toke
         self.rope = rope
         for i in num_layers:
             self.layers.append(MyTransformerBlock(d_model, d_ff, rope, num_heads))
@@ -648,20 +643,13 @@ class MyRMSNorm(torch.nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
         self.eps = eps
-        self.device = device
-        self.dtype = dtype
-        # self.reset_parameters()
-        self.g = torch.nn.Parameter(torch.empty(d_model))
+        self.weight = torch.nn.Parameter(torch.empty(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Note: Remember to upcast your input to torch.float32 before performing the normalization
-        # (and later downcast to the original dtype), as described above.
-        # x is (batch_size, sequence_length, d_model)
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        squares = x**2
-        rms = torch.sqrt(squares.mean(dim=-1, keepdim=True) + self.eps)
-        x = x / rms * self.g
+        rms = torch.sqrt((x**2).mean(dim=-1, keepdim=True) + self.eps)
+        x = x / rms * self.weight
         return x.to(in_dtype)
 
 
