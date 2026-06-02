@@ -35,7 +35,7 @@ class MyLinear(torch.nn.Module):
         # self.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x @ self.weight.T
+        out = x @ self.weights.T
         return out
 
 
@@ -260,10 +260,10 @@ def run_multihead_self_attention(
     head_attention = MyMultiHeadAttention(d_model, num_heads)
     head_attention.load_state_dict(
         {
-            "q": q_proj_weight,
-            "k": k_proj_weight,
-            "v": v_proj_weight,
-            "o": o_proj_weight,
+            "q_proj": q_proj_weight,
+            "k_proj": k_proj_weight,
+            "v_proj": v_proj_weight,
+            "output_proj": o_proj_weight,
         }
     )
     return head_attention(in_features, token_positions=None)
@@ -314,10 +314,10 @@ def run_multihead_self_attention_with_rope(
     head_attention = MyMultiHeadAttention(d_model, num_heads, rope=rope)
     head_attention.load_state_dict(
         {
-            "q": rearrange(q_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
-            "k": rearrange(k_proj_weight, "(num_heads d_k) d_model2 -> num_heads d_k d_model2", num_heads=num_heads),
-            "v": rearrange(v_proj_weight, "(num_heads d_v)  d_model2 -> num_heads d_v d_model2", num_heads=num_heads),
-            "o": o_proj_weight,
+            "q_proj": q_proj_weight,
+            "k_proj": k_proj_weight,
+            "v_proj": v_proj_weight,
+            "output_proj": o_proj_weight,
         },
         strict=False,
     )
@@ -509,12 +509,16 @@ def run_transformer_block(
 
     transformer_block = MyTransformerBlock(d_model, d_ff, rope, num_heads)
 
-    transformer_block.load_state_dict(
-        weights,
-        strict=False,
-    )
+    converted = {}
+    for key, value in weights.items():
+        parts = key.split(".")
+        if len(parts) == 3 and parts[2] == "weight":
+            converted[f"{parts[0]}.{parts[1]}"] = value
+        else:
+            converted[key] = value
 
-    # assert False, f"Weights: {weights.keys()}\nModel: {transformer_block.state_dict().keys()}"
+    transformer_block.load_state_dict(converted, strict=False)
+
     token_positions = torch.arange(in_features.shape[-2]).unsqueeze(0).expand(in_features.shape[:-1])
     return transformer_block(in_features, token_positions)
 
@@ -525,29 +529,25 @@ class MyTransformerLM(torch.nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
-        self.layers = []
 
         d_k = d_model // num_heads
         rope = MyRope(rope_theta, d_k, context_length)
         self.rope = rope
-        for i in num_layers:
-            self.layers.append(MyTransformerBlock(d_model, d_ff, rope, num_heads))
+        self.layers = torch.nn.ModuleList(
+            [MyTransformerBlock(d_model, d_ff, rope, num_heads) for _ in range(num_layers)]
+        )
 
         self.token_embeddings = MyEmbedding(vocab_size, d_model)
         self.ln_final = MyRMSNorm(d_model)
         self.lm_head = MyLinear(d_model, vocab_size)
 
     def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
-        x = in_features
-        x = self.token_embeddings(x)
+        x = self.token_embeddings(in_features)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, token_positions)
 
-        # Output of layer is Float[Tensor, "batch sequence_length d_model"]
         x = self.ln_final(x)
         x = self.lm_head(x)
-        x = run_softmax(x, -1)
-
         return x
 
 
@@ -631,12 +631,31 @@ def run_transformer_lm(
         next-word distribution for each token.
     """
 
-    d_k = d_model // num_heads
-    rope = MyRope(rope_theta, d_k, context_length)
+    model = MyTransformerLM(vocab_size, context_length, d_model, d_ff, num_layers, rope_theta, num_heads)
 
-    transformer_block = MyTransformerBlock(d_model, d_ff, rope, num_heads)
+    converted = {}
+    for key, value in weights.items():
+        if key in ("token_embeddings.weight", "lm_head.weight"):
+            converted[key + "s"] = value
+        elif key.endswith(
+            (
+                ".q_proj.weight",
+                ".k_proj.weight",
+                ".v_proj.weight",
+                ".output_proj.weight",
+                ".w1.weight",
+                ".w2.weight",
+                ".w3.weight",
+            )
+        ):
+            converted[key.rsplit(".weight", 1)[0]] = value
+        else:
+            converted[key] = value
 
-    raise NotImplementedError
+    model.load_state_dict(converted, strict=False)
+
+    token_positions = torch.arange(in_indices.shape[-1]).unsqueeze(0).expand(in_indices.shape)
+    return model(in_indices, token_positions)
 
 
 class MyRMSNorm(torch.nn.Module):
