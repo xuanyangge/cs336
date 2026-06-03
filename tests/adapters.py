@@ -13,6 +13,9 @@ from einops import rearrange, einsum
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from collections.abc import Callable, Iterable
+from typing import Optional
+
 
 class MyLinear(torch.nn.Module):
     """
@@ -731,6 +734,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
+
     raise NotImplementedError
 
 
@@ -756,7 +760,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
 
 
 def run_cross_entropy(
-    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+    inputs: Float[Tensor, "... batch_size vocab_size"], targets: Int[Tensor, "... batch_size"]
 ) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
@@ -770,7 +774,20 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+
+    # expanding the loss function, the first term is just the sum of all logits for the target index, the second term is the sum of the sum of logits for each sample.
+    total_sample = math.prod(inputs.shape[:-1])
+    one_hot = torch.nn.functional.one_hot(targets, num_classes=inputs.shape[-1]).float()
+    result = (inputs * one_hot).sum(-1)
+    first_term = -1 * einsum(result, "... b->")
+    max_inputs = torch.max(inputs, dim=-1, keepdim=True).values
+    inputs = inputs - max_inputs
+    exp_sum = einsum(torch.exp(inputs), "... b v ->... b")
+    second_term_tensor = torch.log(exp_sum)
+
+    second_term = einsum(second_term_tensor, "... b ->")
+    third_term = einsum(max_inputs, "...->")
+    return (first_term + second_term + third_term) / total_sample
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -782,14 +799,74 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    # grads = [p.grad for p in parameters if p.grad is not None]
+    # if not grads:
+    #     return
+    # # total_norm = torch.sqrt(sum([(g**2).sum() for g in grads]))
+    # total_norm = torch.sqrt(sum((g**2).sum() for g in grads))
+    # if total_norm >= max_l2_norm:
+    #     scale = max_l2_norm / (total_norm + 1e-6)
+    #     for g in grads:
+    #         g.mul(scale)
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return
+
+    # total_norm = torch.sqrt(sum((g.detach() ** 2).sum() for g in grads))
+    total_norm = torch.sqrt(sum([(g.detach() ** 2).sum() for g in grads]))
+
+    eps = 1e-6
+    clip_coef = max_l2_norm / (total_norm + eps)
+    if total_norm > max_l2_norm:
+        for g in grads:
+            g.detach().mul_(clip_coef)
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr, "weight_decay": weight_decay, "betas": betas, "eps": eps}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]  # Get the learning rate.
+            b1, b2 = group["betas"]
+            weight_decay = group["weight_decay"]
+            eps = group["eps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]  # Get state associated with p.
+                t = state.get("t", 0)  # Get iteration number from the state, or 0.
+                m = state.get("m", 0)
+                v = state.get("v", 0)
+                grad = p.grad.data  # Get the gradient of loss with respect to p.
+                # learning_rate
+                lr_t = lr * sqrt(1 - b2 ** (t + 1)) / (1 - b1 ** (t + 1))
+                p.data -= lr * p.data * weight_decay
+                state["m"] = b1 * m + (1 - b1) * grad
+                state["v"] = b2 * v + (1 - b2) * (grad**2)
+                state["t"] = t + 1
+                p.data -= lr_t * state["m"] / (torch.sqrt(state["v"]) + eps)
+        return loss
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -817,7 +894,17 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+
+    t_w = warmup_iters
+    t_c = cosine_cycle_iters
+
+    if it < t_w:
+        return it / t_w * max_learning_rate
+    elif it <= t_c:
+        angle = (it - t_w) / (t_c - t_w) * math.pi
+        return min_learning_rate + 1 / 2 * (1 + math.cos(angle)) * (max_learning_rate - min_learning_rate)
+    else:
+        return min_learning_rate
 
 
 def run_save_checkpoint(
