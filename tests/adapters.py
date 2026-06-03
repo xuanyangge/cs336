@@ -6,6 +6,7 @@ from typing import IO, Any, BinaryIO
 from math import sqrt
 
 import numpy.typing as npt
+from numpy import random
 import torch
 import regex as re
 import math
@@ -729,13 +730,29 @@ def run_get_batch(
         device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
             to place the sampled input sequences and labels on.
 
+
     Returns:
         Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
+    sample_start_ind = random.choice(len(dataset) - context_length, batch_size)
+    device = torch.device(device)
 
-    raise NotImplementedError
+    input_tensor = torch.tensor([dataset[i : i + context_length] for i in sample_start_ind], device=device)
+    output_tensor = torch.tensor([dataset[i + 1 : i + 1 + context_length] for i in sample_start_ind], device=device)
+
+    # What if the dataset is too big to load into memory? We can use a Unix system call named mmap which
+    # maps a file on disk to virtual memory, and lazily loads the file contents when that memory location is
+    # accessed. Thus, you can “pretend” you have the entire dataset in memory. Numpy implements this
+    # through np.memmap (or the flag mmap_mode='r' to np.load, if you originally saved the array with np.save),
+    # which will return a numpy array-like object that loads the entries on-demand as you access them. When
+    # sampling from your dataset (i.e., a numpy array) during training, be sure to load the
+    # dataset in memory-mapped mode (via np.memmap or the flag mmap_mode='r' to np.load, depending on
+    # how you saved the array). Make sure you also specify a dtype that matches the array that you’re loading.
+    # It may be helpful to explicitly verify that the memory-mapped data looks correct (e.g., doesn’t contain
+    # values beyond the expected vocabulary size).
+    return (input_tensor, output_tensor)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -923,7 +940,10 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+
+    torch.save(
+        {"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "iteration": iteration}, out
+    )
 
 
 def run_load_checkpoint(
@@ -944,4 +964,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint["model_state"])
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    return checkpoint["iteration"]
