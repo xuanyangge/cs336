@@ -33,13 +33,16 @@ class MyLinear(torch.nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weights = torch.nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+
+        std = sqrt(2 / (in_features + out_features))
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        torch.nn.init.trunc_normal_(self.weight, 0, std, -3 * std, 3 * std)
         self.device = device
         self.dtype = dtype
         # self.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x @ self.weights.T
+        out = x @ self.weight.T
         return out
 
 
@@ -48,13 +51,14 @@ class MyEmbedding(torch.nn.Module):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weights = torch.nn.Parameter(torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype))
+        self.weight = torch.nn.Parameter(torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype))
+        torch.nn.init.trunc_normal_(self.weight, 0, 1, -3, 3)
         self.device = device
         self.dtype = dtype
         # self.reset_parameters()
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        out = self.weights[token_ids]
+        out = self.weight[token_ids]
         return out
 
 
@@ -79,7 +83,7 @@ def run_linear(
     layer = MyLinear(d_in, d_out)
     layer.load_state_dict(
         {
-            "weights": weights,
+            "weight": weights,
         }
     )
     return layer(in_features)
@@ -104,7 +108,7 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
     embedding = MyEmbedding(vocab_size, d_model)
-    embedding.load_state_dict({"weights": weights})
+    embedding.load_state_dict({"weight": weights})
     return embedding(token_ids)
 
 
@@ -113,15 +117,15 @@ class MySwiglu(torch.nn.Module):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
-        self.w1 = torch.nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
-        self.w2 = torch.nn.Parameter(torch.empty(d_model, d_ff, device=device, dtype=dtype))
-        self.w3 = torch.nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
+        self.w1 = MyLinear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = MyLinear(d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = MyLinear(d_model, d_ff, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w1_x = einsum(self.w1, x, "d_ff d_model, ... d_model -> ... d_ff")
+        w1_x = self.w1(x)
         silu_w1_x = w1_x * torch.sigmoid(w1_x)
-        w1_w3 = silu_w1_x * einsum(self.w3, x, "d_ff d_model, ... d_model -> ... d_ff")
-        out = einsum(self.w2, w1_w3, "d_model d_ff, ... d_ff -> ... d_model")
+        w1_w3 = silu_w1_x * self.w3(x)
+        out = self.w2(w1_w3)
         return out
 
 
@@ -157,7 +161,7 @@ def run_swiglu(
 
     swiglu = MySwiglu(d_model, d_ff)
 
-    swiglu.load_state_dict({"w1": w1_weight, "w2": w2_weight, "w3": w3_weight})
+    swiglu.load_state_dict({"w1.weight": w1_weight, "w2.weight": w2_weight, "w3.weight": w3_weight})
 
     return swiglu(in_features)
 
@@ -200,36 +204,37 @@ class MyMultiHeadAttention(torch.nn.Module):
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
         self.rope = rope
-        self.q_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model, device=device, dtype=dtype))
-        self.k_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model, device=device, dtype=dtype))
-        self.v_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model, device=device, dtype=dtype))
-        self.output_proj = torch.nn.Parameter(torch.empty(self.d_model, self.d_model, device=device, dtype=dtype))
+        self.q_proj = MyLinear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = MyLinear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = MyLinear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = MyLinear(d_model, d_model, device=device, dtype=dtype)
         self.device = device
 
     def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
-        v_proj = rearrange(
-            self.v_proj, "(num_heads d_v) d_model -> num_heads d_v d_model", num_heads=self.num_heads, d_v=self.d_v
-        )
-        k_proj = rearrange(
-            self.k_proj, "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=self.num_heads, d_k=self.d_k
-        )
-        q_proj = rearrange(
-            self.q_proj, "(num_heads d_k) d_model -> num_heads d_k d_model", num_heads=self.num_heads, d_k=self.d_k
-        )
+        w_v_x = self.v_proj(in_features)
+        w_k_x = self.k_proj(in_features)
+        w_q_x = self.q_proj(in_features)
 
-        w_v_x = einsum(v_proj, in_features, "num_heads d_v d_model, ... d_model -> num_heads ... d_v")
-        w_k_x = einsum(k_proj, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
-        w_q_x = einsum(q_proj, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+        w_v_x = rearrange(
+            w_v_x,
+            "...  (num_heads d_v) ->  num_heads ... d_v",
+            num_heads=self.num_heads,
+            d_v=self.d_v,
+        )
+        w_k_x = rearrange(w_k_x, "... (num_heads d_k)  -> num_heads ... d_k", num_heads=self.num_heads, d_k=self.d_k)
+        w_q_x = rearrange(w_q_x, "... (num_heads d_k) -> num_heads ... d_k", num_heads=self.num_heads, d_k=self.d_k)
+
+        # w_q_x = einsum(q_proj, in_features, "num_heads d_k d_model, ... d_model -> num_heads ... d_k")
+
         if self.rope is not None:
             w_k_x = self.rope(w_k_x, token_positions)
             w_q_x = self.rope(w_q_x, token_positions)
+
         mask = torch.tril(torch.full((in_features.shape[-2], in_features.shape[-2]), 1, device=self.device)).bool()
         attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask, device=self.device)
         # attenion is num_heads queries d_v
         concatted_attention = rearrange(attention, "num_heads ... queries d_v -> ... queries (num_heads d_v)")
-        return einsum(
-            self.output_proj, concatted_attention, "d_model d_model2, ... seq_len d_model2 -> ... seq_len d_model"
-        )
+        return self.output_proj(concatted_attention)
 
 
 def run_multihead_self_attention(
@@ -266,10 +271,10 @@ def run_multihead_self_attention(
     head_attention = MyMultiHeadAttention(d_model, num_heads)
     head_attention.load_state_dict(
         {
-            "q_proj": q_proj_weight,
-            "k_proj": k_proj_weight,
-            "v_proj": v_proj_weight,
-            "output_proj": o_proj_weight,
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
         }
     )
     return head_attention(in_features, token_positions=None)
@@ -320,10 +325,10 @@ def run_multihead_self_attention_with_rope(
     head_attention = MyMultiHeadAttention(d_model, num_heads, rope=rope)
     head_attention.load_state_dict(
         {
-            "q_proj": q_proj_weight,
-            "k_proj": k_proj_weight,
-            "v_proj": v_proj_weight,
-            "output_proj": o_proj_weight,
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
         },
         strict=False,
     )
@@ -521,15 +526,15 @@ def run_transformer_block(
 
     transformer_block = MyTransformerBlock(d_model, d_ff, rope, num_heads)
 
-    converted = {}
-    for key, value in weights.items():
-        parts = key.split(".")
-        if len(parts) == 3 and parts[2] == "weight":
-            converted[f"{parts[0]}.{parts[1]}"] = value
-        else:
-            converted[key] = value
+    # converted = {}
+    # for key, value in weights.items():
+    #     parts = key.split(".")
+    #     if len(parts) == 3 and parts[2] == "weight":
+    #         converted[f"{parts[0]}.{parts[1]}"] = value
+    #     else:
+    #         converted[key] = value
 
-    transformer_block.load_state_dict(converted, strict=False)
+    transformer_block.load_state_dict(weights, strict=False)
 
     token_positions = torch.arange(in_features.shape[-2]).unsqueeze(0).expand(in_features.shape[:-1])
     return transformer_block(in_features, token_positions)
@@ -651,26 +656,7 @@ def run_transformer_lm(
 
     model = MyTransformerLM(vocab_size, context_length, d_model, d_ff, num_layers, rope_theta, num_heads)
 
-    converted = {}
-    for key, value in weights.items():
-        if key in ("token_embeddings.weight", "lm_head.weight"):
-            converted[key + "s"] = value
-        elif key.endswith(
-            (
-                ".q_proj.weight",
-                ".k_proj.weight",
-                ".v_proj.weight",
-                ".output_proj.weight",
-                ".w1.weight",
-                ".w2.weight",
-                ".w3.weight",
-            )
-        ):
-            converted[key.rsplit(".weight", 1)[0]] = value
-        else:
-            converted[key] = value
-
-    model.load_state_dict(converted, strict=False)
+    model.load_state_dict(weights, strict=False)
 
     token_positions = torch.arange(in_indices.shape[-1]).unsqueeze(0).expand(in_indices.shape)
     return model(in_indices, token_positions)
@@ -680,7 +666,7 @@ class MyRMSNorm(torch.nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
         self.eps = eps
-        self.weight = torch.nn.Parameter(torch.empty(d_model, device=device, dtype=dtype))
+        self.weight = torch.nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
@@ -711,7 +697,7 @@ def run_rmsnorm(
         RMSNorm of the `in_features`.
     """
     rms_norm = MyRMSNorm(d_model, eps)
-    rms_norm.load_state_dict({"g": weights})
+    rms_norm.load_state_dict({"weight": weights})
     return rms_norm(in_features)
 
 
