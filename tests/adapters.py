@@ -742,16 +742,6 @@ def run_get_batch(
     input_tensor = torch.tensor([dataset[i : i + context_length] for i in sample_start_ind], device=device)
     output_tensor = torch.tensor([dataset[i + 1 : i + 1 + context_length] for i in sample_start_ind], device=device)
 
-    # What if the dataset is too big to load into memory? We can use a Unix system call named mmap which
-    # maps a file on disk to virtual memory, and lazily loads the file contents when that memory location is
-    # accessed. Thus, you can “pretend” you have the entire dataset in memory. Numpy implements this
-    # through np.memmap (or the flag mmap_mode='r' to np.load, if you originally saved the array with np.save),
-    # which will return a numpy array-like object that loads the entries on-demand as you access them. When
-    # sampling from your dataset (i.e., a numpy array) during training, be sure to load the
-    # dataset in memory-mapped mode (via np.memmap or the flag mmap_mode='r' to np.load, depending on
-    # how you saved the array). Make sure you also specify a dtype that matches the array that you’re loading.
-    # It may be helpful to explicitly verify that the memory-mapped data looks correct (e.g., doesn’t contain
-    # values beyond the expected vocabulary size).
     return (input_tensor, output_tensor)
 
 
