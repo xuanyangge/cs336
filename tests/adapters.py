@@ -33,7 +33,7 @@ class MyLinear(torch.nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weights = torch.nn.Parameter(torch.empty(out_features, in_features))
+        self.weights = torch.nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
         self.device = device
         self.dtype = dtype
         # self.reset_parameters()
@@ -48,7 +48,7 @@ class MyEmbedding(torch.nn.Module):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weights = torch.nn.Parameter(torch.empty(num_embeddings, embedding_dim))
+        self.weights = torch.nn.Parameter(torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype))
         self.device = device
         self.dtype = dtype
         # self.reset_parameters()
@@ -113,9 +113,9 @@ class MySwiglu(torch.nn.Module):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
-        self.w1 = torch.nn.Parameter(torch.empty(d_ff, d_model))
-        self.w2 = torch.nn.Parameter(torch.empty(d_model, d_ff))
-        self.w3 = torch.nn.Parameter(torch.empty(d_ff, d_model))
+        self.w1 = torch.nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
+        self.w2 = torch.nn.Parameter(torch.empty(d_model, d_ff, device=device, dtype=dtype))
+        self.w3 = torch.nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w1_x = einsum(self.w1, x, "d_ff d_model, ... d_model -> ... d_ff")
@@ -167,6 +167,7 @@ def run_scaled_dot_product_attention(
     K: Float[Tensor, " ... keys d_k"],
     V: Float[Tensor, " ... keys d_v"],
     mask: Bool[Tensor, " ... queries keys"] | None = None,
+    device=None,
 ) -> Float[Tensor, " ... queries d_v"]:
     """
     Given key (K), query (Q), and value (V) tensors, return
@@ -185,7 +186,7 @@ def run_scaled_dot_product_attention(
     d_k = Q.shape[-1]
     Q_K_T = Q_K_T / sqrt(d_k)
     if mask is not None:
-        infinity_matrix = torch.full_like(Q_K_T, -1 * torch.inf)
+        infinity_matrix = torch.full_like(Q_K_T, -1 * torch.inf, device=device)
         Q_K_T = torch.where(mask, Q_K_T, infinity_matrix)
     soft_maxed_Q_K_t = run_softmax(Q_K_T, -1)
     return einsum(soft_maxed_Q_K_t, V, "... queries keys, ... keys d_v -> ... queries d_v")
@@ -199,10 +200,11 @@ class MyMultiHeadAttention(torch.nn.Module):
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
         self.rope = rope
-        self.q_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model))
-        self.k_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model))
-        self.v_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model))
-        self.output_proj = torch.nn.Parameter(torch.empty(self.d_model, self.d_model))
+        self.q_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model, device=device, dtype=dtype))
+        self.k_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model, device=device, dtype=dtype))
+        self.v_proj = torch.nn.Parameter(torch.empty(d_model, self.d_model, device=device, dtype=dtype))
+        self.output_proj = torch.nn.Parameter(torch.empty(self.d_model, self.d_model, device=device, dtype=dtype))
+        self.device = device
 
     def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
         v_proj = rearrange(
@@ -221,8 +223,8 @@ class MyMultiHeadAttention(torch.nn.Module):
         if self.rope is not None:
             w_k_x = self.rope(w_k_x, token_positions)
             w_q_x = self.rope(w_q_x, token_positions)
-        mask = torch.tril(torch.full((in_features.shape[-2], in_features.shape[-2]), 1)).bool()
-        attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask)
+        mask = torch.tril(torch.full((in_features.shape[-2], in_features.shape[-2]), 1, device=self.device)).bool()
+        attention = run_scaled_dot_product_attention(w_q_x, w_k_x, w_v_x, mask, device=self.device)
         # attenion is num_heads queries d_v
         concatted_attention = rearrange(attention, "num_heads ... queries d_v -> ... queries (num_heads d_v)")
         return einsum(
@@ -350,9 +352,9 @@ class MyRope(torch.nn.Module):
         #   #         [20, 40],
         #   #         [30, 60]])
 
-        arr = torch.arange(1.0, d_k // 2 + 1.0, 1)
+        arr = torch.arange(1.0, d_k // 2 + 1.0, 1, device=device)
         arr = self.theta ** (-1 * (2 * arr - 2) / d_k)
-        seq = torch.arange(0, max_seq_len * 1.0, 1)
+        seq = torch.arange(0, max_seq_len * 1.0, 1, device=device)
         # (max_seq_len, d_k / 2)
         angle_matrix = torch.outer(seq, arr)
 
@@ -416,15 +418,21 @@ def run_rope(
 
 
 class MyTransformerBlock(torch.nn.Module):
-    def __init__(self, d_model, d_ff, rope: MyRope, num_heads=4):
+    def __init__(self, d_model, d_ff, rope: MyRope, num_heads=4, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
-        self.ln1 = MyRMSNorm(d_model)
-        self.attn = MyMultiHeadAttention(d_model, num_heads, rope=rope)
-        self.ffn = MySwiglu(d_model, d_ff)
-        self.ln2 = MyRMSNorm(d_model)
+        self.ln1 = MyRMSNorm(d_model, device=device, dtype=dtype)
+        self.attn = MyMultiHeadAttention(
+            d_model,
+            num_heads,
+            device,
+            dtype,
+            rope=rope,
+        )
+        self.ffn = MySwiglu(d_model, d_ff, device=device, dtype=dtype)
+        self.ln2 = MyRMSNorm(d_model, device=device, dtype=dtype)
         self.rope = rope
 
     def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
@@ -528,25 +536,31 @@ def run_transformer_block(
 
 
 class MyTransformerLM(torch.nn.Module):
-    def __init__(self, vocab_size, context_length, d_model, d_ff, num_layers, rope_theta, num_heads=4):
+    def __init__(
+        self, vocab_size, context_length, d_model, d_ff, num_layers, rope_theta, num_heads=4, device=None, dtype=None
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
 
         d_k = d_model // num_heads
-        rope = MyRope(rope_theta, d_k, context_length)
+        rope = MyRope(rope_theta, d_k, context_length, device=device)
         self.rope = rope
         self.layers = torch.nn.ModuleList(
-            [MyTransformerBlock(d_model, d_ff, rope, num_heads) for _ in range(num_layers)]
+            [MyTransformerBlock(d_model, d_ff, rope, num_heads, device=device, dtype=dtype) for _ in range(num_layers)]
         )
 
-        self.token_embeddings = MyEmbedding(vocab_size, d_model)
-        self.ln_final = MyRMSNorm(d_model)
-        self.lm_head = MyLinear(d_model, vocab_size)
+        self.token_embeddings = MyEmbedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.ln_final = MyRMSNorm(d_model, device=device, dtype=dtype)
+        self.lm_head = MyLinear(d_model, vocab_size, device=device, dtype=dtype)
 
-    def forward(self, in_features: torch.Tensor, token_positions) -> torch.Tensor:
+    def forward(self, in_features: torch.Tensor, token_positions=None) -> torch.Tensor:
         x = self.token_embeddings(in_features)
+
+        if token_positions is None:
+            token_positions = torch.arange(in_features.shape[-1]).unsqueeze(0).expand(in_features.shape)
+
         for layer in self.layers:
             x = layer(x, token_positions)
 
@@ -666,7 +680,7 @@ class MyRMSNorm(torch.nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
         self.eps = eps
-        self.weight = torch.nn.Parameter(torch.empty(d_model))
+        self.weight = torch.nn.Parameter(torch.empty(d_model, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
@@ -784,9 +798,9 @@ def run_cross_entropy(
 
     # expanding the loss function, the first term is just the sum of all logits for the target index, the second term is the sum of the sum of logits for each sample.
     total_sample = math.prod(inputs.shape[:-1])
-    one_hot = torch.nn.functional.one_hot(targets, num_classes=inputs.shape[-1]).float()
-    result = (inputs * one_hot).sum(-1)
+    result = torch.gather(inputs, -1, targets.unsqueeze(-1))
     first_term = -1 * einsum(result, "... b->")
+
     max_inputs = torch.max(inputs, dim=-1, keepdim=True).values
     inputs = inputs - max_inputs
     exp_sum = einsum(torch.exp(inputs), "... b v ->... b")

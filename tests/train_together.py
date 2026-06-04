@@ -4,6 +4,7 @@ from pathlib import Path
 from .adapters import MyTransformerLM, AdamW, run_get_lr_cosine_schedule, run_cross_entropy, run_gradient_clipping
 import numpy.typing as npt
 import numpy as np
+import torch.nn.functional as F
 
 
 def parse_args():
@@ -27,7 +28,7 @@ def parse_args():
     # Training loop
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--eval_batch_size", type=int, default=200)
-    p.add_argument("--gradient_clipping_max", type=float, default=1e-2)
+    p.add_argument("--gradient_clipping_max", type=float, default=1)
     p.add_argument("--num_steps", type=int, default=10_000)
     p.add_argument("--eval_interval", type=int, default=500)
     p.add_argument("--checkpoint_interval", type=int, default=1_000)
@@ -57,7 +58,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_dataset(path):
+def load_dataset(path, args):
     dataset = np.memmap(path, dtype=np.uint16, mode="r")
 
     return dataset
@@ -67,8 +68,12 @@ def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device
     sample_start_ind = np.random.choice(len(dataset) - context_length, batch_size)
     device = torch.device(device)
 
-    input_tensor = torch.tensor([dataset[i : i + context_length] for i in sample_start_ind], device=device)
-    output_tensor = torch.tensor([dataset[i + 1 : i + 1 + context_length] for i in sample_start_ind], device=device)
+    input_tensor = torch.tensor(
+        np.array([dataset[i : i + context_length] for i in sample_start_ind]), device=device, dtype=torch.int
+    )
+    output_tensor = torch.tensor(
+        np.array([dataset[i + 1 : i + context_length + 1] for i in sample_start_ind]), device=device, dtype=torch.int
+    )
     return input_tensor, output_tensor
 
 
@@ -81,7 +86,9 @@ def build_model(args):
         num_layers=args.num_layers,
         rope_theta=args.rope_theta,
         num_heads=args.num_heads,
+        device=args.device,
     )
+    # model = model.to(args.device)
     return model
 
 
@@ -97,16 +104,39 @@ def build_optimizer(model, args):
 
 
 def train_step(model, batch, optimizer, args, step):
-    input, output = batch
+    (input, output) = batch
     logits = model(input)
     loss = run_cross_entropy(logits, output)
+    # loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), output.reshape(-1).long())
+    # print("loss.requires_grad:", loss.requires_grad)
+    # print("loss.grad_fn:", loss.grad_fn)
+    # print("logits.requires_grad:", logits.requires_grad)
+    # print("logits.grad_fn:", logits.grad_fn)
+
     loss.backward()
     run_gradient_clipping(model.parameters(), args.gradient_clipping_max)
     for param_group in optimizer.param_groups:
         param_group["lr"] = run_get_lr_cosine_schedule(
             step, args.max_lr, args.min_lr, args.num_warmup_steps, args.cosine_cycle_iters
         )
+        # print(f"step={step} lr={param_group['lr']}")
+
+    # check output
+    # p = [para for para in model.parameters()]
+    # before = [para.detach().clone() for para in p]
+
     optimizer.step()
+
+    # for name, p in model.named_parameters():
+    #     if p.grad is None:
+    #         print(f"{name}: NO GRAD")
+    #     elif p.grad.abs().max().item() == 0:
+    #         print(f"{name}: zero grad")
+    #     else:
+    #         print(f"{name}: max grad={p.grad.abs().max().item()}")
+
+    # for i in range(len(p)):
+    #     print("max delta:", (p[i] - before[i]).abs().max().item())
     optimizer.zero_grad()
     return loss.item()
 
@@ -137,8 +167,8 @@ def main():
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed)
 
-    train_data = load_dataset(args.train_data)
-    eval_data = load_dataset(args.eval_data)
+    train_data = load_dataset(args.train_data, args)
+    eval_data = load_dataset(args.eval_data, args)
     eval_batch = get_batch(eval_data, args.eval_batch_size, args.context_length, args.device)
 
     model = build_model(args)
@@ -148,12 +178,20 @@ def main():
     if args.resume_from is not None:
         start_step = load_checkpoint(args.resume_from, model, optimizer)
 
+    # x1 = torch.randint(0, args.vocab_size, (1, 16), device=args.device)
+    # x2 = torch.randint(0, args.vocab_size, (1, 16), device=args.device)
+    # y1 = model(x1)
+    # y2 = model(x2)
+    # print("outputs differ:", not torch.equal(y1, y2))
+    # print("y1 stats: std", y1.std().item(), "mean", y1.mean().item(), "abs max", y1.abs().max().item())
+    # print("first few logits:", y1.flatten()[:10])
+
     for step in range(start_step, args.num_steps):
         batch = get_batch(train_data, args.batch_size, args.context_length, args.device)
         loss = train_step(model, batch, optimizer, args, step)
 
         if step % args.log_interval == 0:
-            print(f"step={step} train_loss={loss:.4f}")
+            print(f"step={step} train_loss={loss:.10f}")
 
         if step > 0 and step % args.eval_interval == 0:
             eval_loss = evaluate(model, eval_batch, args)
