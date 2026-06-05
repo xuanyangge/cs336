@@ -167,3 +167,6 @@ tests/data/
 
 # Tokenized dataset binaries
 *.bin
+
+# Model checkpoints
+checkpoints/
