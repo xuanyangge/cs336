@@ -564,7 +564,7 @@ class MyTransformerLM(torch.nn.Module):
         x = self.token_embeddings(in_features)
 
         if token_positions is None:
-            token_positions = torch.arange(in_features.shape[-1]).unsqueeze(0).expand(in_features.shape)
+            token_positions = torch.arange(in_features.shape[-1]).expand(in_features.shape)
 
         for layer in self.layers:
             x = layer(x, token_positions)

@@ -4,7 +4,7 @@ from pathlib import Path
 from .adapters import MyTransformerLM, AdamW, run_get_lr_cosine_schedule, run_cross_entropy, run_gradient_clipping
 import numpy.typing as npt
 import numpy as np
-import torch.nn.functional as F
+import uuid
 
 
 def parse_args():
@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument("--max_lr", type=float, default=1e-3)
     p.add_argument("--min_lr", type=float, default=1e-4)
     p.add_argument("--num_warmup_steps", type=int, default=500)
-    p.add_argument("--cosine_cycle_iters", type=int, default=3000)
+    p.add_argument("--cosine_cycle_iters", type=int, default=5000)
 
     # Paths
     p.add_argument("--train_data", type=Path, required=True)
@@ -107,11 +107,6 @@ def train_step(model, batch, optimizer, args, step):
     (input, output) = batch
     logits = model(input)
     loss = run_cross_entropy(logits, output)
-    # loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), output.reshape(-1).long())
-    # print("loss.requires_grad:", loss.requires_grad)
-    # print("loss.grad_fn:", loss.grad_fn)
-    # print("logits.requires_grad:", logits.requires_grad)
-    # print("logits.grad_fn:", logits.grad_fn)
 
     loss.backward()
     run_gradient_clipping(model.parameters(), args.gradient_clipping_max)
@@ -119,24 +114,9 @@ def train_step(model, batch, optimizer, args, step):
         param_group["lr"] = run_get_lr_cosine_schedule(
             step, args.max_lr, args.min_lr, args.num_warmup_steps, args.cosine_cycle_iters
         )
-        # print(f"step={step} lr={param_group['lr']}")
-
-    # check output
-    # p = [para for para in model.parameters()]
-    # before = [para.detach().clone() for para in p]
 
     optimizer.step()
 
-    # for name, p in model.named_parameters():
-    #     if p.grad is None:
-    #         print(f"{name}: NO GRAD")
-    #     elif p.grad.abs().max().item() == 0:
-    #         print(f"{name}: zero grad")
-    #     else:
-    #         print(f"{name}: max grad={p.grad.abs().max().item()}")
-
-    # for i in range(len(p)):
-    #     print("max delta:", (p[i] - before[i]).abs().max().item())
     optimizer.zero_grad()
     return loss.item()
 
@@ -164,7 +144,13 @@ def load_checkpoint(path, model, optimizer):
 
 def main():
     args = parse_args()
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    run_name = str(uuid.uuid4())
+    checkpoint_dir = Path(args.checkpoint_dir) / run_name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(checkpoint_dir / "training_param.txt", "w") as f:
+        f.write(str(args))
+
     set_seed(args.seed)
 
     train_data = load_dataset(args.train_data, args)
@@ -178,29 +164,24 @@ def main():
     if args.resume_from is not None:
         start_step = load_checkpoint(args.resume_from, model, optimizer)
 
-    # x1 = torch.randint(0, args.vocab_size, (1, 16), device=args.device)
-    # x2 = torch.randint(0, args.vocab_size, (1, 16), device=args.device)
-    # y1 = model(x1)
-    # y2 = model(x2)
-    # print("outputs differ:", not torch.equal(y1, y2))
-    # print("y1 stats: std", y1.std().item(), "mean", y1.mean().item(), "abs max", y1.abs().max().item())
-    # print("first few logits:", y1.flatten()[:10])
+    with open(checkpoint_dir / "training_log.txt", "w") as f:
+        for step in range(start_step, args.num_steps):
+            batch = get_batch(train_data, args.batch_size, args.context_length, args.device)
+            loss = train_step(model, batch, optimizer, args, step)
 
-    for step in range(start_step, args.num_steps):
-        batch = get_batch(train_data, args.batch_size, args.context_length, args.device)
-        loss = train_step(model, batch, optimizer, args, step)
+            if step % args.log_interval == 0:
+                print(f"step={step} train_loss={loss:.10f}")
+                f.write(f"step={step} train_loss={loss:.10f}\n")
 
-        if step % args.log_interval == 0:
-            print(f"step={step} train_loss={loss:.10f}")
+            if step > 0 and step % args.eval_interval == 0:
+                eval_loss = evaluate(model, eval_batch, args)
+                print(f"step={step} eval_loss={eval_loss:.4f}")
+                f.write(f"step={step} eval_loss={eval_loss:.4f}\n")
 
-        if step > 0 and step % args.eval_interval == 0:
-            eval_loss = evaluate(model, eval_batch, args)
-            print(f"step={step} eval_loss={eval_loss:.4f}")
+            if step > 0 and step % args.checkpoint_interval == 0:
+                save_checkpoint(model, optimizer, step, checkpoint_dir)
 
-        if step > 0 and step % args.checkpoint_interval == 0:
-            save_checkpoint(model, optimizer, step, args.checkpoint_dir)
-
-    save_checkpoint(model, optimizer, args.num_steps, args.checkpoint_dir)
+    save_checkpoint(model, optimizer, args.num_steps, checkpoint_dir)
 
 
 if __name__ == "__main__":
