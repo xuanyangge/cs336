@@ -164,6 +164,7 @@ def main():
     if args.resume_from is not None:
         start_step = load_checkpoint(args.resume_from, model, optimizer)
 
+    print("Run name ", run_name)
     with open(checkpoint_dir / "training_log.txt", "w") as f:
         for step in range(start_step, args.num_steps):
             batch = get_batch(train_data, args.batch_size, args.context_length, args.device)

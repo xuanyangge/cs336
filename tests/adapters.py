@@ -129,6 +129,21 @@ class MySwiglu(torch.nn.Module):
         return out
 
 
+class MySilu(torch.nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.w1 = MyLinear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = MyLinear(d_ff, d_model, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w1_x = self.w1(x)
+        silu_w1_x = w1_x * torch.sigmoid(w1_x)
+        out = self.w2(silu_w1_x)
+        return out
+
+
 def run_swiglu(
     d_model: int,
     d_ff: int,
